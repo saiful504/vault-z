@@ -37,12 +37,14 @@ type VaultMedia = NonNullable<VaultItemPayload["mediaLinks"]>[number];
 
 function usePrivateMediaUrl(media: VaultMedia, key: CryptoKey | null, reloadToken = 0, enabled = true) {
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [privateDownloadUrl, setPrivateDownloadUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [offlineReady, setOfflineReady] = useState(false);
 
   useEffect(() => {
     let active = true;
     setStreamUrl(null);
+    setPrivateDownloadUrl(null);
     setError(null);
     setOfflineReady(false);
     if (!media.fileId || !enabled) return () => { active = false; };
@@ -59,24 +61,28 @@ function usePrivateMediaUrl(media: VaultMedia, key: CryptoKey | null, reloadToke
               objectUrl = URL.createObjectURL(cached);
               if (active) {
                 setStreamUrl(objectUrl);
+                setPrivateDownloadUrl(objectUrl);
                 setOfflineReady(true);
               }
               return;
             }
           } catch {
-            // A stale cache entry should not prevent streaming the MEGA original.
+            // A stale cache entry should not prevent streaming the cloud original.
           }
         }
-        const api = process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL?.replace(/\/$/, "");
-        if (!api) throw new Error("MEGA upload service is not configured.");
+        const api = (process.env.NEXT_PUBLIC_MEDIA_UPLOAD_API_URL || process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL)?.replace(/\/$/, "");
+        if (!api) throw new Error("Media service is not configured.");
         const response = await fetch(`${api}/media/${encodeURIComponent(media.fileId!)}/access`, {
           method: "POST",
           headers: { Authorization: `Bearer ${session.access_token}`, "Content-Type": "application/json" },
           body: JSON.stringify({ contentType: media.contentType }),
         });
-        const result = await response.json() as { streamUrl?: string; error?: string };
+        const result = await response.json() as { streamUrl?: string; downloadUrl?: string; error?: string };
         if (!response.ok || !result.streamUrl) throw new Error(result.error || "Could not open this media.");
-        if (active) setStreamUrl(result.streamUrl);
+        if (active) {
+          setStreamUrl(result.streamUrl);
+          setPrivateDownloadUrl(result.downloadUrl || `${result.streamUrl}&download=1`);
+        }
       } catch (err) {
         if (active) setError(err instanceof Error ? err.message : "Could not open this media.");
       }
@@ -85,7 +91,7 @@ function usePrivateMediaUrl(media: VaultMedia, key: CryptoKey | null, reloadToke
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [media.fileId, media.contentType, key, reloadToken, enabled]);
 
-  return { streamUrl, error, offlineReady };
+  return { streamUrl, privateDownloadUrl, error, offlineReady };
 }
 
 type GalleryAsset = { item: DecryptedVaultItem; media: VaultMedia };
@@ -106,8 +112,8 @@ function GalleryTile({ asset, keyValue, reloadToken, onOpen, onRemove }: { asset
     observer.observe(element);
     return () => observer.disconnect();
   }, [inView]);
-  const { streamUrl, error, offlineReady } = usePrivateMediaUrl(media, keyValue, reloadToken, inView);
-  const downloadUrl = streamUrl ? (offlineReady ? streamUrl : `${streamUrl}&download=1`) : media.url;
+  const { streamUrl, privateDownloadUrl, error, offlineReady } = usePrivateMediaUrl(media, keyValue, reloadToken, inView);
+  const downloadUrl = streamUrl ? (offlineReady ? streamUrl : privateDownloadUrl) : media.url;
   return (
     <article ref={tileRef} className="group overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
       <button type="button" onClick={onOpen} aria-label={`View ${media.name || media.type}`} className="relative block aspect-square w-full overflow-hidden bg-zinc-100 text-left dark:bg-zinc-900">
@@ -191,15 +197,15 @@ export function MediaGallery({ items, onChanged, loading = false }: { items: Dec
       const supabase = createClient();
       if (permanent && media.fileId) {
         const { data: { session } } = await supabase.auth.getSession();
-        if (!session) throw new Error("Sign in again before deleting from MEGA.");
-        const api = process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL?.replace(/\/$/, "");
-        if (!api) throw new Error("MEGA upload service is not configured.");
+        if (!session) throw new Error("Sign in again before deleting this media file.");
+        const api = (process.env.NEXT_PUBLIC_MEDIA_UPLOAD_API_URL || process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL)?.replace(/\/$/, "");
+        if (!api) throw new Error("Media service is not configured.");
         const response = await fetch(`${api}/media/${encodeURIComponent(media.fileId)}`, {
           method: "DELETE",
           headers: { Authorization: `Bearer ${session.access_token}` },
         });
         const result = await response.json() as { error?: string };
-        if (!response.ok && response.status !== 404) throw new Error(result.error || "Could not delete this file from MEGA.");
+        if (!response.ok && response.status !== 404) throw new Error(result.error || "Could not delete this media file.");
         await clearCachedMedia(session.user.id, media.fileId);
         setCacheReloadToken((value) => value + 1);
       }
@@ -229,11 +235,11 @@ export function MediaGallery({ items, onChanged, loading = false }: { items: Dec
   }
 
   const selectedMedia = selected?.media;
-  const { streamUrl: selectedUrl, error: selectedError, offlineReady: selectedOfflineReady } = usePrivateMediaUrl(selectedMedia ?? {
+  const { streamUrl: selectedUrl, privateDownloadUrl: selectedDownloadUrl, error: selectedError, offlineReady: selectedOfflineReady } = usePrivateMediaUrl(selectedMedia ?? {
     type: "image", name: "", contentType: "image/jpeg", size: 0,
   }, key, cacheReloadToken, Boolean(selectedMedia));
   const selectedLegacyEmbed = selectedMedia?.url ? megaEmbedUrl(selectedMedia.url) : null;
-  const downloadUrl = selectedUrl ? (selectedOfflineReady ? selectedUrl : `${selectedUrl}&download=1`) : selectedMedia?.url ?? null;
+  const downloadUrl = selectedUrl ? (selectedOfflineReady ? selectedUrl : selectedDownloadUrl) : selectedMedia?.url ?? null;
 
   async function saveSelectedOffline() {
     if (!selectedMedia?.fileId || !selectedUrl || !key) return;
@@ -330,9 +336,9 @@ export function MediaGallery({ items, onChanged, loading = false }: { items: Dec
 
       {deleteTarget ? <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/60 p-3 sm:items-center" role="presentation" onClick={() => { if (!busy) setDeleteTarget(null); }}>
         <section role="dialog" aria-modal="true" aria-labelledby="gallery-delete-title" className="w-full max-w-md space-y-4 rounded-2xl bg-white p-5 shadow-xl dark:bg-zinc-950" onClick={(event) => event.stopPropagation()}>
-          <div><h2 id="gallery-delete-title" className="text-lg font-semibold">Manage {deleteTarget.media.name || deleteTarget.media.type}</h2><p className="mt-2 text-sm text-zinc-500">Clear this app’s encrypted offline copy while keeping it in your gallery and MEGA. Exported device files are managed by your device.</p></div>
-          <button type="button" disabled={busy || !deleteTarget.media.fileId} onClick={() => void removeSelected(false)} className="min-h-12 w-full rounded-lg border border-zinc-300 px-4 text-sm font-medium dark:border-zinc-700">{busy ? "Clearing…" : "Clear offline copy · keep gallery and MEGA"}</button>
-          <button type="button" disabled={busy || !deleteTarget.media.fileId} onClick={() => void removeSelected(true)} className="min-h-12 w-full rounded-lg bg-red-700 px-4 text-sm font-medium text-white disabled:opacity-50">{busy ? "Deleting…" : "Delete permanently from MEGA"}</button>
+          <div><h2 id="gallery-delete-title" className="text-lg font-semibold">Manage {deleteTarget.media.name || deleteTarget.media.type}</h2><p className="mt-2 text-sm text-zinc-500">Clear this app’s encrypted offline copy while keeping it in your gallery and cloud storage. Exported device files are managed by your device.</p></div>
+          <button type="button" disabled={busy || !deleteTarget.media.fileId} onClick={() => void removeSelected(false)} className="min-h-12 w-full rounded-lg border border-zinc-300 px-4 text-sm font-medium dark:border-zinc-700">{busy ? "Clearing…" : "Clear offline copy · keep gallery and cloud file"}</button>
+          <button type="button" disabled={busy || !deleteTarget.media.fileId} onClick={() => void removeSelected(true)} className="min-h-12 w-full rounded-lg bg-red-700 px-4 text-sm font-medium text-white disabled:opacity-50">{busy ? "Deleting…" : "Delete permanently from cloud storage"}</button>
           {!deleteTarget.media.fileId ? <p className="text-xs text-zinc-500">This older shared link has no app-managed offline copy.</p> : null}
           <button type="button" disabled={busy} onClick={() => setDeleteTarget(null)} className="min-h-11 w-full rounded-lg px-4 text-sm text-zinc-500">Cancel</button>
         </section>

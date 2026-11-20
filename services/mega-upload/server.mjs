@@ -1,5 +1,6 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Storage } from "megajs";
 import { createClient } from "@supabase/supabase-js";
 
@@ -7,6 +8,10 @@ const port = Number(process.env.PORT || 8787);
 const frontendOrigin = process.env.FRONTEND_ORIGIN;
 const megaEmail = process.env.MEGA_EMAIL;
 const megaPassword = process.env.MEGA_PASSWORD;
+const r2AccountId = process.env.R2_ACCOUNT_ID;
+const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID;
+const r2SecretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+const r2BucketName = process.env.R2_BUCKET_NAME;
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 const mediaTokenSecret = process.env.MEDIA_TOKEN_SECRET;
@@ -18,7 +23,7 @@ try {
   const parsed = new URL(mediaPublicOriginValue);
 
   if (
-    parsed.protocol !== "https:" ||
+    (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1"].includes(parsed.hostname))) ||
     parsed.pathname !== "/" ||
     parsed.search ||
     parsed.hash
@@ -29,7 +34,7 @@ try {
   mediaPublicOrigin = parsed.origin;
 } catch {
   throw new Error(
-    "MEDIA_PUBLIC_ORIGIN must be a valid HTTPS origin."
+    "MEDIA_PUBLIC_ORIGIN must be an HTTPS origin (HTTP is allowed for localhost development)."
   );
 }
 
@@ -44,12 +49,20 @@ const maxFiles = Number(process.env.MAX_FILES_PER_ITEM || 20);
 const maxFilesPerUser = Number(process.env.MAX_FILES_PER_USER || 500);
 const maxBytesPerUser = Number(process.env.MAX_BYTES_PER_USER || 2 * 1024 * 1024 * 1024);
 
-if (!frontendOrigin || !megaEmail || !megaPassword || !supabaseUrl || !supabaseKey || !mediaTokenSecret || mediaTokenSecret.length < 32) {
-  throw new Error("Set FRONTEND_ORIGIN, MEGA_EMAIL, MEGA_PASSWORD, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, and a MEDIA_TOKEN_SECRET of at least 32 characters.");
+if (!frontendOrigin || !r2AccountId || !r2AccessKeyId || !r2SecretAccessKey || !r2BucketName || !supabaseUrl || !supabaseKey || !mediaTokenSecret || mediaTokenSecret.length < 32) {
+  throw new Error("Set FRONTEND_ORIGIN, MEDIA_PUBLIC_ORIGIN, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, and a MEDIA_TOKEN_SECRET of at least 32 characters.");
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: { autoRefreshToken: false, persistSession: false },
+});
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT || `https://${r2AccountId}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: r2AccessKeyId,
+    secretAccessKey: r2SecretAccessKey,
+  },
 });
 let megaStoragePromise;
 let megaBlockedUntil = 0;
@@ -59,17 +72,10 @@ function isMegaBlocked(error) {
   return Number(error?.code) === -16 || /\bEBLOCKED\b|user blocked/i.test(error instanceof Error ? error.message : String(error || ""));
 }
 
-function megaErrorResponse(error, fallback) {
-  if (isMegaBlocked(error)) {
-    return {
-      status: 503,
-      message: "MEGA rejected this account or connection (EBLOCKED -16). The service will pause retries for 15 minutes. Check the account at mega.nz; if it remains blocked, contact MEGA support.",
-    };
-  }
-  return { status: 502, message: error instanceof Error ? error.message : fallback };
-}
-
 function getMegaStorage() {
+  if (!megaEmail || !megaPassword) {
+    return Promise.reject(new Error("This is a legacy MEGA file, but MEGA_EMAIL and MEGA_PASSWORD are not configured."));
+  }
   if (Date.now() < megaBlockedUntil) {
     return Promise.reject(new Error("MEGA rejected this account or connection (EBLOCKED -16). Automatic retries are paused for 15 minutes."));
   }
@@ -133,9 +139,48 @@ async function getUserFiles(storage, userId, createFolder = false) {
   return { folder, files };
 }
 
-async function getUserFile(storage, userId, fileId) {
+async function getUserFile(userId, fileId) {
+  if (fileId.startsWith("r2_")) {
+    const key = `users/${userId}/${fileId}`;
+    try {
+      const result = await r2.send(new HeadObjectCommand({ Bucket: r2BucketName, Key: key }));
+      return {
+        name: result.Metadata?.name ? decodeURIComponent(result.Metadata.name) : "media",
+        size: Number(result.ContentLength || 0),
+        download(range) {
+          const rangeHeader = range?.start !== undefined
+            ? `bytes=${range.start}-${range.end}`
+            : undefined;
+          return r2.send(new GetObjectCommand({ Bucket: r2BucketName, Key: key, ...(rangeHeader ? { Range: rangeHeader } : {}) }))
+            .then((object) => object.Body);
+        },
+        async delete() {
+          await r2.send(new DeleteObjectCommand({ Bucket: r2BucketName, Key: key }));
+        },
+      };
+    } catch (error) {
+      if (error?.name === "NotFound" || error?.name === "NoSuchKey" || error?.$metadata?.httpStatusCode === 404) return null;
+      throw error;
+    }
+  }
+  const storage = await getMegaStorage();
   const { files } = await getUserFiles(storage, userId);
   return files.find((entry) => entry.nodeId === fileId) ?? null;
+}
+
+async function getR2UserFiles(userId) {
+  const files = [];
+  let continuationToken;
+  do {
+    const result = await r2.send(new ListObjectsV2Command({
+      Bucket: r2BucketName,
+      Prefix: `users/${userId}/r2_`,
+      ContinuationToken: continuationToken,
+    }));
+    files.push(...(result.Contents || []));
+    continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return files;
 }
 
 function signMediaToken(fileId, userId, contentType) {
@@ -173,7 +218,7 @@ async function readSmallJson(request) {
 }
 
 function isFileId(value) {
-  return /^[A-Za-z0-9_-]{6,20}$/.test(value);
+  return /^[A-Za-z0-9_-]{6,64}$/.test(value);
 }
 
 function parseByteRange(value, size) {
@@ -254,16 +299,23 @@ const server = createServer(async (request, response) => {
     name = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 180) || "upload";
 
     try {
-      const storage = await getMegaStorage();
-      const { folder, files } = await getUserFiles(storage, auth.user.id, true);
-      const usedBytes = files.reduce((total, file) => total + (Number(file.size) || 0), 0);
+      const files = await getR2UserFiles(auth.user.id);
+      const usedBytes = files.reduce((total, file) => total + (Number(file.Size) || 0), 0);
       if (files.length >= maxFilesPerUser || usedBytes + size > maxBytesPerUser) {
         request.resume();
         sendJson(response, 413, { error: "Your media storage limit has been reached." }, origin);
         return;
       }
-      const uploaded = await folder.upload({ name, size }, request).complete;
-      const fileId = uploaded.nodeId;
+      const fileId = `r2_${randomUUID().replaceAll("-", "")}`;
+      const key = `users/${auth.user.id}/${fileId}`;
+      await r2.send(new PutObjectCommand({
+        Bucket: r2BucketName,
+        Key: key,
+        Body: request,
+        ContentLength: size,
+        ContentType: contentType,
+        Metadata: { name: encodeURIComponent(name), owner: auth.user.id },
+      }));
       sendJson(response, 201, {
         fileId,
         name,
@@ -274,14 +326,13 @@ const server = createServer(async (request, response) => {
     } catch (error) {
       request.resume();
       if (!response.headersSent) {
-        const failure = megaErrorResponse(error, "MEGA upload failed.");
-        sendJson(response, failure.status, { error: failure.message }, origin);
+        sendJson(response, 502, { error: error instanceof Error ? error.message : "R2 upload failed." }, origin);
       }
     }
     return;
   }
 
-  const mediaRoute = /^\/media\/([A-Za-z0-9_-]{6,20})(?:\/(access|stream))?$/.exec(url.pathname);
+  const mediaRoute = /^\/media\/([A-Za-z0-9_-]{6,64})(?:\/(access|stream))?$/.exec(url.pathname);
   if (!mediaRoute) {
     sendJson(response, 404, { error: "Not found." }, origin);
     return;
@@ -297,7 +348,7 @@ const server = createServer(async (request, response) => {
     }
     if (!isFileId(fileId)) {
       request.resume();
-      sendJson(response, 400, { error: "Invalid MEGA file ID." }, origin);
+      sendJson(response, 400, { error: "Invalid media file ID." }, origin);
       return;
     }
     let contentType;
@@ -314,14 +365,13 @@ const server = createServer(async (request, response) => {
     }
     request.resume();
     try {
-      const file = await getUserFile(await getMegaStorage(), auth.user.id, fileId);
+      const file = await getUserFile(auth.user.id, fileId);
       if (!file) {
         sendJson(response, 404, { error: "This file is not in your media library." }, origin);
         return;
       }
     } catch (error) {
-      const failure = megaErrorResponse(error, "Could not access your MEGA files.");
-      sendJson(response, failure.status, { error: failure.message }, origin);
+      sendJson(response, 502, { error: error instanceof Error ? error.message : "Could not access this media file." }, origin);
       return;
     }
     const token = signMediaToken(fileId, auth.user.id, contentType);
@@ -349,10 +399,9 @@ const server = createServer(async (request, response) => {
       return;
     }
     try {
-      const storage = await getMegaStorage();
-      const file = await getUserFile(storage, claims.userId, fileId);
+      const file = await getUserFile(claims.userId, fileId);
       if (!file) {
-        sendJson(response, 404, { error: "This file is no longer in the MEGA account." }, origin);
+        sendJson(response, 404, { error: "This file is no longer in storage." }, origin);
         return;
       }
       const rangeHeader = request.headers.range;
@@ -375,15 +424,14 @@ const server = createServer(async (request, response) => {
       } else {
         response.writeHead(200, { ...headers, "Content-Length": file.size });
       }
-      const stream = file.download(range || {});
+      const stream = await file.download(range || {});
       stream.on("error", (error) => {
         response.destroy(error);
       });
       stream.pipe(response);
     } catch (error) {
       if (!response.headersSent) {
-        const failure = megaErrorResponse(error, "Could not stream this MEGA file.");
-        sendJson(response, failure.status, { error: failure.message }, origin);
+        sendJson(response, 502, { error: error instanceof Error ? error.message : "Could not stream this media file." }, origin);
       }
     }
     return;
@@ -397,17 +445,16 @@ const server = createServer(async (request, response) => {
       return;
     }
     try {
-      const storage = await getMegaStorage();
-      const file = await getUserFile(storage, auth.user.id, fileId);
+      const file = await getUserFile(auth.user.id, fileId);
       if (!file) {
-        sendJson(response, 404, { error: "This file is no longer in the MEGA account." }, origin);
+        sendJson(response, 404, { error: "This file is no longer in storage." }, origin);
         return;
       }
-      await file.delete(true);
+      if (fileId.startsWith("r2_")) await file.delete();
+      else await file.delete(true);
       sendJson(response, 200, { deleted: true }, origin);
     } catch (error) {
-      const failure = megaErrorResponse(error, "Could not permanently delete this MEGA file.");
-      sendJson(response, failure.status, { error: failure.message }, origin);
+      sendJson(response, 502, { error: error instanceof Error ? error.message : "Could not permanently delete this media file." }, origin);
     }
     return;
   }
@@ -416,5 +463,5 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, "0.0.0.0", () => {
-  console.log(`MEGA upload service listening on ${port}`);
+  console.log(`Media upload service listening on ${port}`);
 });

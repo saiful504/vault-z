@@ -70,12 +70,8 @@ export function ItemForm({ onSaved }: ItemFormProps) {
       let uploadedMedia: { type: "image" | "video"; fileId: string; name: string; contentType: string; size: number }[] = [];
       if (mediaMode) {
         if (isDemoMode) throw new Error("Media upload requires a signed-in Supabase account.");
-        const uploadApi = process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL?.replace(/\/$/, "");
-        if (!uploadApi) throw new Error("Set NEXT_PUBLIC_MEGA_UPLOAD_API_URL to your MEGA upload service URL.");
-        const uploadApiHost = new URL(uploadApi).hostname;
-        if (uploadApiHost === "mega.nz" || uploadApiHost.endsWith(".mega.nz") || uploadApiHost === "mega.co.nz" || uploadApiHost.endsWith(".mega.co.nz")) {
-          throw new Error("Use your MEGA upload service URL here, not a MEGA File Request link.");
-        }
+        const uploadApi = (process.env.NEXT_PUBLIC_MEDIA_UPLOAD_API_URL || process.env.NEXT_PUBLIC_MEGA_UPLOAD_API_URL)?.replace(/\/$/, "");
+        if (!uploadApi) throw new Error("Set NEXT_PUBLIC_MEDIA_UPLOAD_API_URL to your media service URL.");
         const supabase = createClient();
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) throw new Error("You must be signed in to upload media.");
@@ -230,8 +226,8 @@ export function ItemForm({ onSaved }: ItemFormProps) {
         <DocumentScanner onChange={(image) => setDocumentImage(image)} />
       ) : mediaMode ? (
         <fieldset className="space-y-3">
-          <legend className="text-sm font-medium">Upload images and videos to MEGA</legend>
-          <p className="text-xs text-zinc-500">Choose up to 20 files from your device. Files upload to MEGA first; their links are then encrypted in your vault item.</p>
+          <legend className="text-sm font-medium">Upload images and videos</legend>
+          <p className="text-xs text-zinc-500">Choose up to 20 files from your device. Files upload to private cloud storage; their references are then encrypted in your vault item.</p>
           <input type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/avif,video/mp4,video/webm,video/quicktime,video/ogg" onChange={(event) => { setMediaFiles(Array.from(event.target.files ?? [])); setError(null); }} className="block min-h-12 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-zinc-100 file:px-3 file:py-2 dark:border-zinc-700 dark:file:bg-zinc-800" />
           {mediaFiles.length ? <ul className="space-y-1 text-xs text-zinc-500">{mediaFiles.map((file, index) => <li key={`${file.name}-${index}`} className="truncate">{file.type.startsWith("video/") ? "Video" : "Image"}: {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MB</li>)}</ul> : null}
           {uploadProgress ? <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">Uploading {uploadProgress.current} of {uploadProgress.total}: {uploadProgress.name}</p> : null}
