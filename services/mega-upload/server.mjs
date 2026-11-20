@@ -10,6 +10,29 @@ const megaPassword = process.env.MEGA_PASSWORD;
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
 const mediaTokenSecret = process.env.MEDIA_TOKEN_SECRET;
+const mediaPublicOriginValue = process.env.MEDIA_PUBLIC_ORIGIN;
+
+let mediaPublicOrigin;
+
+try {
+  const parsed = new URL(mediaPublicOriginValue);
+
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error("Invalid public origin.");
+  }
+
+  mediaPublicOrigin = parsed.origin;
+} catch {
+  throw new Error(
+    "MEDIA_PUBLIC_ORIGIN must be a valid HTTPS origin."
+  );
+}
+
 const legacyRootOwnerIds = new Set(
   `${process.env.LEGACY_MEGA_ROOT_OWNER_USER_IDS || ""},${process.env.UPLOAD_ALLOWED_USER_IDS || ""}`
     .split(",")
@@ -302,8 +325,19 @@ const server = createServer(async (request, response) => {
       return;
     }
     const token = signMediaToken(fileId, auth.user.id, contentType);
+    const streamUrl = new URL(
+      `/media/${fileId}/stream`,
+      mediaPublicOrigin
+    );
+
+    streamUrl.searchParams.set("token", token);
+
+    const downloadUrl = new URL(streamUrl);
+    downloadUrl.searchParams.set("download", "1");
+
     sendJson(response, 200, {
-      streamUrl: `${url.origin}/media/${fileId}/stream?token=${encodeURIComponent(token)}`,
+      streamUrl: streamUrl.toString(),
+      downloadUrl: downloadUrl.toString(),
     }, origin);
     return;
   }
